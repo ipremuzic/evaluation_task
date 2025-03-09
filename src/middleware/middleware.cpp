@@ -8,9 +8,62 @@
 
 LOG_MODULE_REGISTER(middleware, LOG_LEVEL_DBG);
 
+#define LED_CTRL_THRD_STACKSZ 512
+
 struct input_event_msg {
 	bool input_active;
-};									
+};
+
+struct fifo_data_item {
+	void *fifo_reserved;
+	bool input_state;
+};
+
+K_FIFO_DEFINE(led_ctrl_fifo);
+
+static void led_ctrl_thrd(void *thrd_ctx, void *unused1, void *unused2)
+{
+	struct fifo_data_item *fifo_data;
+	int ret;
+
+	while (1) {
+		fifo_data =
+				(struct fifo_data_item *) k_fifo_get(&led_ctrl_fifo, K_FOREVER);
+
+		if (fifo_data->input_state) {
+			/* If the state is high, blink the LED 3 times with 100ms between each blink */
+			for (int i = 0; i < 3; i++) {
+				ret = turn_on_led();
+				if (ret)
+					LOG_ERR("Failed to turn on LED %d", ret);
+
+				k_msleep(100);
+
+				ret = turn_off_led();
+				if (ret)
+					LOG_ERR("Failed to turn off LED %d", ret);
+
+				k_msleep(100);
+			}
+		} else {
+			/* If the state is low, turn the LED on and keep it on for 500ms */
+			ret = turn_on_led();
+			if (ret)
+				LOG_ERR("Failed to turn on LED %d", ret);
+
+			k_msleep(500);
+
+			ret = turn_off_led();
+			if (ret)
+				LOG_ERR("Failed to turn off LED %d", ret);
+		}
+
+		k_free(fifo_data);
+	}
+}
+
+K_THREAD_DEFINE(lec_ctrl_tid, LED_CTRL_THRD_STACKSZ, led_ctrl_thrd, NULL, NULL,
+				NULL, K_PRIO_PREEMPT(1), 0, 0);
 
 ZBUS_CHAN_DEFINE(input_event_chan,					/* Name */
 				 struct input_event_msg,			/* Message type */
@@ -21,63 +74,15 @@ ZBUS_CHAN_DEFINE(input_event_chan,					/* Name */
 				 ZBUS_MSG_INIT(0) 					/* Initial value {0} */
 );
 
-static void turn_off_led_dwork_handler(struct k_work *work)
-{
-	int ret;
-
-	ret = turn_off_led();
-	if (ret)
-		LOG_ERR("Failed to turn on LED, %d", ret);
-}
-
-static K_WORK_DELAYABLE_DEFINE(turn_off_led_dwork, turn_off_led_dwork_handler);
-
-static void turn_on_led_dwork_handler(struct k_work *work)
-{
-	int ret;
-	ret = turn_on_led();
-	if(ret)
-		LOG_ERR("Failed to turn off LED %d", ret);
-}
-
-static K_WORK_DELAYABLE_DEFINE(turn_on_led_dwork, turn_on_led_dwork_handler);
-
-static uint32_t toggle_count = 0;
-
-static void blink_led_dwork_handler(struct k_work *work)
-{
-	int ret;
-	ret = toggle_led();
-	if (ret) {
-		LOG_ERR("Failed to toggle LED, %d", ret);
-		return;
-	}
-
-	toggle_count++;
-
-	/* Toogle on and off 3 times */
-	if (toggle_count % 6 == 0)
-		return;
-
-	k_work_reschedule(k_work_delayable_from_work(work), K_MSEC(100));
-}
-
-static K_WORK_DELAYABLE_DEFINE(blink_led_dwork, blink_led_dwork_handler);
-
 static void listener_cb(const struct zbus_channel *chan)
 {
-	const struct input_event_msg *msg =
-					(const struct input_event_msg *) zbus_chan_const_msg(chan);
+	const struct input_event_msg *msg;
+	struct fifo_data_item *fifo_data;
 
-	if (msg->input_active) {
-		/* If the state is high, blink the LED 3 times with 100ms between each blink */
-		k_work_reschedule(&blink_led_dwork, K_NO_WAIT);
-	} else {
-		/* If the state is low, turn the LED on and keep it on for 500ms */
-		k_work_cancel_delayable(&blink_led_dwork);
-		k_work_reschedule(&turn_on_led_dwork, K_NO_WAIT);
-		k_work_reschedule(&turn_off_led_dwork, K_MSEC(500));
-	}
+	msg = (const struct input_event_msg *) zbus_chan_const_msg(chan);
+	fifo_data = (struct fifo_data_item *) k_malloc(sizeof(fifo_data));
+	fifo_data->input_state = msg->input_active;
+	k_fifo_put(&led_ctrl_fifo, fifo_data);
 }
 
 ZBUS_LISTENER_DEFINE(input_lis, listener_cb);
